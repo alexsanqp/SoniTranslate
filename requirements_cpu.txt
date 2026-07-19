@@ -1,0 +1,15 @@
+# Minimal, CPU-only / offline-friendly dependencies for cpu_dub.py.
+# None of these require a GPU or a Hugging Face token.
+#
+# System packages (install separately, e.g. apt-get / conda):
+#   ffmpeg       - audio/video processing and muxing
+#   espeak-ng    - fully offline text-to-speech (includes a Ukrainian voice)
+#
+# Python packages:
+pydub                 # timeline assembly / overlay (wraps ffmpeg)
+yt-dlp                # media download (only needed for URL inputs)
+openai-whisper        # CPU speech-to-text; downloads an open model, no HF token
+                      # (only needed when transcribing audio; skip if you pass an .srt)
+#
+# Translation uses the public translate.googleapis.com endpoint via the standard
+# library, so no extra package or API key is needed.
