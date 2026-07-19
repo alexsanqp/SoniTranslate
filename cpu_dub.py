@@ -266,6 +266,35 @@ def google_tts(text, lang, wav_path, workdir, retries=4):
     audio.export(wav_path, format="wav")
 
 
+def server_tts(text, wav_path, workdir, url, voice, model, language,
+               api_key=None, retries=3):
+    """Synthesize via an OpenAI-compatible TTS server (POST /v1/audio/speech),
+    e.g. a self-hosted tts-server with edge / StyleTTS2-UK / Qwen providers.
+    Returns whatever audio the server sends, transcoded to wav."""
+    body = json.dumps({
+        "input": text, "voice": voice, "model": model,
+        "language": language, "response_format": "wav",
+    }).encode()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=120) as r:
+                audio = r.read()
+            raw = os.path.join(workdir, "_srv_raw")
+            with open(raw, "wb") as f:
+                f.write(audio)
+            run(["ffmpeg", "-y", "-i", raw, wav_path])  # normalize to wav
+            return
+        except Exception as e:
+            last = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"TTS server request failed: {last}")
+
+
 def _audio_duration(path):
     out = run(
         [
@@ -428,9 +457,14 @@ def main():
         help="mux the dub over this video file (use when --input is an .srt)",
     )
     ap.add_argument(
-        "--tts", default="google", choices=["google", "espeak"],
-        help="TTS backend: google (natural, needs network) or espeak (offline)",
+        "--tts", default="google", choices=["google", "espeak", "server"],
+        help="TTS backend: google (natural, needs network), espeak (offline), "
+        "or server (an OpenAI-compatible /v1/audio/speech endpoint)",
     )
+    ap.add_argument("--tts-url", default=None, help="server backend: speech endpoint URL")
+    ap.add_argument("--tts-voice", default=None, help="server backend: voice id")
+    ap.add_argument("--tts-model", default="auto", help="server backend: model/provider")
+    ap.add_argument("--tts-key", default=os.environ.get("TTS_API_KEY"), help="server backend: bearer token")
     ap.add_argument(
         "--whisper-model", default="base",
         help="openai-whisper model size: tiny/base/small/medium/large",
@@ -501,7 +535,17 @@ def main():
         log(f"translated subtitles written to {args.save_srt}")
 
     # --- Stage 4: synthesize + assemble ------------------------------------
-    if args.tts == "google":
+    if args.tts == "server":
+        if not args.tts_url:
+            log("ERROR: --tts server requires --tts-url")
+            sys.exit(1)
+        log(f"synthesizing via TTS server {args.tts_url} "
+            f"(model={args.tts_model}, voice={args.tts_voice})")
+        synth = lambda text, wav: server_tts(
+            text, wav, workdir, args.tts_url, args.tts_voice,
+            args.tts_model, args.target, args.tts_key,
+        )
+    elif args.tts == "google":
         log(f"synthesizing with Google TTS voice '{args.target}'")
         synth = lambda text, wav: google_tts(text, args.target, wav, workdir)
     else:
