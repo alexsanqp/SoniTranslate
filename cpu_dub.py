@@ -174,15 +174,17 @@ def google_translate(text, source, target, retries=4):
     raise RuntimeError(f"translation failed after {retries} tries: {last_err}")
 
 
-def translate_segments(segments, source, target):
+def translate_segments(segments, source, target, corrections=None):
     """Translate each segment's text. 'auto' is accepted as source."""
     src = "auto" if source in (None, "", "auto") else source
     out = []
     total = len(segments)
     for i, seg in enumerate(segments, 1):
-        translated = google_translate(seg["text"], src, target)
+        translated = html.unescape(google_translate(seg["text"], src, target))
+        for wrong, right in (corrections or {}).items():
+            translated = translated.replace(wrong, right)
         seg = dict(seg)
-        seg["translated"] = html.unescape(translated)
+        seg["translated"] = translated
         out.append(seg)
         if i % 10 == 0 or i == total:
             log(f"translated {i}/{total} segments")
@@ -190,7 +192,9 @@ def translate_segments(segments, source, target):
 
 
 # ---------------------------------------------------------------------------
-# Text to speech - espeak-ng (offline, no token, Ukrainian supported)
+# Text to speech - two CPU backends, neither needs a token:
+#   - google : natural neural-ish voice via translate.googleapis.com (network)
+#   - espeak : fully offline robotic voice via espeak-ng
 # ---------------------------------------------------------------------------
 
 def espeak_tts(text, voice, wav_path, rate=160, pitch=50):
@@ -205,6 +209,61 @@ def espeak_tts(text, voice, wav_path, rate=160, pitch=50):
         "-w", wav_path, text,
     ]
     run(cmd)
+
+
+def _chunk_text(text, limit=190):
+    """Split text into <= limit-char pieces on word boundaries (the public
+    Google TTS endpoint rejects long strings)."""
+    words = text.split()
+    chunks, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > limit:
+            if cur:
+                chunks.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
+
+
+def google_tts(text, lang, wav_path, workdir, retries=4):
+    """Synthesize `text` with the public Google Translate TTS voice (natural,
+    no API key). Long text is chunked and the pieces are concatenated."""
+    from pydub import AudioSegment
+
+    pieces = []
+    for j, chunk in enumerate(_chunk_text(text)):
+        q = urllib.parse.quote(chunk)
+        url = (
+            "https://translate.googleapis.com/translate_tts?ie=UTF-8"
+            f"&q={q}&tl={lang}&client=tw-ob&total=1&idx=0&textlen={len(chunk)}"
+        )
+        last = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0"}
+                )
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    raw = r.read()
+                mp3 = os.path.join(workdir, f"_g_{abs(hash(chunk)) % 10**8}_{j}.mp3")
+                with open(mp3, "wb") as f:
+                    f.write(raw)
+                pieces.append(AudioSegment.from_file(mp3, format="mp3"))
+                break
+            except Exception as e:
+                last = e
+                time.sleep(1.5 * (attempt + 1))
+        else:
+            raise RuntimeError(f"google TTS failed: {last}")
+        time.sleep(0.15)  # be gentle with the endpoint
+
+    audio = pieces[0]
+    for p in pieces[1:]:
+        audio += p
+    audio.export(wav_path, format="wav")
 
 
 def _audio_duration(path):
@@ -243,24 +302,40 @@ def _fit_to_duration(src_wav, dst_wav, target_dur, max_speed=2.2):
 # Assembly - overlay each dubbed clip on a silent timeline (pydub)
 # ---------------------------------------------------------------------------
 
-def assemble_track(segments, voice, rate, workdir, sample_rate=22050):
+def assemble_track(segments, synth, workdir, max_speed=1.5, sample_rate=24000):
+    """Synthesize each segment and lay it on a timeline.
+
+    Placement is sequential: a clip starts at its own timestamp, or right
+    after the previous clip if that one ran long - so clips never overlap and
+    the voice keeps a natural pace. A clip is only sped up (pitch-preserving,
+    capped at `max_speed`) when it would otherwise overflow its slot, which
+    keeps drift from the video small without sounding rushed."""
     from pydub import AudioSegment
 
-    total = max((s["end"] for s in segments), default=0) + 1.0
-    timeline = AudioSegment.silent(
-        duration=int(total * 1000), frame_rate=sample_rate
-    )
-
+    timeline = AudioSegment.silent(duration=1000, frame_rate=sample_rate)
+    cursor = 0  # ms; end of the previously placed clip
     for i, seg in enumerate(segments):
         text = seg.get("translated") or seg["text"]
         raw = os.path.join(workdir, f"seg_{i:05d}.wav")
-        fit = os.path.join(workdir, f"seg_{i:05d}_fit.wav")
-        espeak_tts(text, voice, raw, rate=rate)
+        synth(text, raw)
+
         slot = seg["end"] - seg["start"]
-        _fit_to_duration(raw, fit, slot)
-        clip = AudioSegment.from_file(fit)
-        timeline = timeline.overlay(clip, position=int(seg["start"] * 1000))
-        if (i + 1) % 10 == 0 or i + 1 == len(segments):
+        dur = _audio_duration(raw)
+        if slot > 0 and dur > slot * max_speed:
+            fit = os.path.join(workdir, f"seg_{i:05d}_fit.wav")
+            _fit_to_duration(raw, fit, dur / max_speed)
+            raw = fit
+        clip = AudioSegment.from_file(raw)
+
+        pos = max(int(seg["start"] * 1000), cursor)
+        end = pos + len(clip)
+        if end + 500 > len(timeline):
+            timeline += AudioSegment.silent(
+                duration=end + 500 - len(timeline), frame_rate=sample_rate
+            )
+        timeline = timeline.overlay(clip, position=pos)
+        cursor = end
+        if (i + 1) % 5 == 0 or i + 1 == len(segments):
             log(f"synthesized {i + 1}/{len(segments)} segments")
 
     return timeline
@@ -322,24 +397,34 @@ def main():
     ap.add_argument("--target", default="uk", help="target language code (default: uk)")
     ap.add_argument("--output", default="dub_output.wav", help="output file path")
     ap.add_argument(
+        "--video", default=None,
+        help="mux the dub over this video file (use when --input is an .srt)",
+    )
+    ap.add_argument(
+        "--tts", default="google", choices=["google", "espeak"],
+        help="TTS backend: google (natural, needs network) or espeak (offline)",
+    )
+    ap.add_argument(
         "--whisper-model", default="base",
         help="openai-whisper model size: tiny/base/small/medium/large",
     )
     ap.add_argument("--tts-rate", type=int, default=160, help="espeak words per minute")
+    ap.add_argument(
+        "--max-speed", type=float, default=1.5,
+        help="max pitch-preserving speed-up used to fit a slot (1.0 = never)",
+    )
     ap.add_argument(
         "--save-srt", default=None,
         help="also write the translated subtitles to this .srt path",
     )
     args = ap.parse_args()
 
-    voice = ESPEAK_VOICE.get(args.target, args.target)
-
     workdir = tempfile.mkdtemp(prefix="cpu_dub_")
     log(f"work dir: {workdir}")
 
     # --- Stage 1+2: obtain timed source segments ---------------------------
     inp = args.input
-    media_path = None
+    media_path = args.video
     if inp.lower().endswith(".srt"):
         log("input is a subtitle file - skipping download and ASR (fully offline)")
         segments = parse_srt(inp)
@@ -359,14 +444,27 @@ def main():
     log(f"{len(segments)} source segments")
 
     # --- Stage 3: translate -------------------------------------------------
-    segments = translate_segments(segments, args.source, args.target)
+    # A few machine-translation glitches that are wrong in this medical context.
+    corrections = {
+        "головку": "голову", "головки": "голови", "головок": "голови",
+        "головка": "голова", "Головка": "Голова",
+        "Кришталевий падає": "кристал випадає",
+        "Одного разу кристал випадає": "щойно кристал випадає",
+    }
+    segments = translate_segments(segments, args.source, args.target, corrections)
     if args.save_srt:
         write_srt(segments, args.save_srt, key="translated")
         log(f"translated subtitles written to {args.save_srt}")
 
     # --- Stage 4: synthesize + assemble ------------------------------------
-    log(f"synthesizing with espeak-ng voice '{voice}'")
-    track = assemble_track(segments, voice, args.tts_rate, workdir)
+    if args.tts == "google":
+        log(f"synthesizing with Google TTS voice '{args.target}'")
+        synth = lambda text, wav: google_tts(text, args.target, wav, workdir)
+    else:
+        voice = ESPEAK_VOICE.get(args.target, args.target)
+        log(f"synthesizing with espeak-ng voice '{voice}'")
+        synth = lambda text, wav: espeak_tts(text, voice, wav, rate=args.tts_rate)
+    track = assemble_track(segments, synth, workdir, max_speed=args.max_speed)
 
     # --- Stage 5: export / mux ---------------------------------------------
     out = args.output
@@ -380,7 +478,9 @@ def main():
             [
                 "ffmpeg", "-y", "-i", media_path, "-i", audio_wav,
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-shortest", out,
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+                "-metadata:s:a:0", f"language={args.target}",
+                "-shortest", out,
             ]
         )
     else:
