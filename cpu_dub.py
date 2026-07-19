@@ -302,18 +302,24 @@ def _fit_to_duration(src_wav, dst_wav, target_dur, max_speed=2.2):
 # Assembly - overlay each dubbed clip on a silent timeline (pydub)
 # ---------------------------------------------------------------------------
 
-def assemble_track(segments, synth, workdir, max_speed=1.5, sample_rate=24000):
+def assemble_track(segments, synth, workdir, max_speed=1.8, sync="anchor",
+                   sample_rate=24000):
     """Synthesize each segment and lay it on a timeline.
 
-    Placement is sequential: a clip starts at its own timestamp, or right
-    after the previous clip if that one ran long - so clips never overlap and
-    the voice keeps a natural pace. A clip is only sped up (pitch-preserving,
-    capped at `max_speed`) when it would otherwise overflow its slot, which
-    keeps drift from the video small without sounding rushed."""
+    sync="anchor" (default): every clip is pinned to its own start timestamp
+    and, when it is longer than its slot, sped up (pitch-preserving, capped at
+    `max_speed`) to fit. Because each segment re-anchors to the video timeline,
+    lag never accumulates - the dub stays in sync from start to finish. A clip
+    that still overflows after the cap is trimmed to its slot so it can't spill
+    into the next line.
+
+    sync="sequential": clips play back-to-back at a natural pace (a clip starts
+    after the previous one if that ran long). Lower speed-up, but drift can
+    build up over a long video."""
     from pydub import AudioSegment
 
     timeline = AudioSegment.silent(duration=1000, frame_rate=sample_rate)
-    cursor = 0  # ms; end of the previously placed clip
+    cursor = 0  # ms; end of the previously placed clip (sequential mode)
     for i, seg in enumerate(segments):
         text = seg.get("translated") or seg["text"]
         raw = os.path.join(workdir, f"seg_{i:05d}.wav")
@@ -321,13 +327,27 @@ def assemble_track(segments, synth, workdir, max_speed=1.5, sample_rate=24000):
 
         slot = seg["end"] - seg["start"]
         dur = _audio_duration(raw)
-        if slot > 0 and dur > slot * max_speed:
-            fit = os.path.join(workdir, f"seg_{i:05d}_fit.wav")
-            _fit_to_duration(raw, fit, dur / max_speed)
-            raw = fit
-        clip = AudioSegment.from_file(raw)
+        is_last = i + 1 == len(segments)
 
-        pos = max(int(seg["start"] * 1000), cursor)
+        if sync == "anchor":
+            # Speed up only as much as this slot needs (up to the cap).
+            if slot > 0 and dur > slot:
+                fit = os.path.join(workdir, f"seg_{i:05d}_fit.wav")
+                _fit_to_duration(raw, fit, slot, max_speed=max_speed)
+                raw = fit
+            clip = AudioSegment.from_file(raw)
+            # Hard safety trim so a still-too-long clip never overlaps the next.
+            if not is_last and slot > 0 and len(clip) > int(slot * 1000):
+                clip = clip[: int(slot * 1000)].fade_out(40)
+            pos = int(seg["start"] * 1000)
+        else:  # sequential
+            if slot > 0 and dur > slot * max_speed:
+                fit = os.path.join(workdir, f"seg_{i:05d}_fit.wav")
+                _fit_to_duration(raw, fit, dur / max_speed, max_speed=max_speed)
+                raw = fit
+            clip = AudioSegment.from_file(raw)
+            pos = max(int(seg["start"] * 1000), cursor)
+
         end = pos + len(clip)
         if end + 500 > len(timeline):
             timeline += AudioSegment.silent(
@@ -335,9 +355,16 @@ def assemble_track(segments, synth, workdir, max_speed=1.5, sample_rate=24000):
             )
         timeline = timeline.overlay(clip, position=pos)
         cursor = end
-        if (i + 1) % 5 == 0 or i + 1 == len(segments):
+        if (i + 1) % 5 == 0 or is_last:
             log(f"synthesized {i + 1}/{len(segments)} segments")
 
+    # Pad with trailing silence to the end of the last slot so muxing with
+    # -shortest keeps the full video length instead of trimming its tail.
+    final_ms = int(max(s["end"] for s in segments) * 1000)
+    if len(timeline) < final_ms:
+        timeline += AudioSegment.silent(
+            duration=final_ms - len(timeline), frame_rate=sample_rate
+        )
     return timeline
 
 
@@ -417,6 +444,16 @@ def main():
         "--save-srt", default=None,
         help="also write the translated subtitles to this .srt path",
     )
+    ap.add_argument(
+        "--pre-translated", action="store_true",
+        help="the input .srt is already in the target language; skip "
+        "translation and speak its text as-is (lets you hand-tune wording)",
+    )
+    ap.add_argument(
+        "--sync", default="anchor", choices=["anchor", "sequential"],
+        help="anchor: pin each line to its timestamp (no drift); "
+        "sequential: back-to-back natural pace (can drift)",
+    )
     args = ap.parse_args()
 
     workdir = tempfile.mkdtemp(prefix="cpu_dub_")
@@ -444,14 +481,21 @@ def main():
     log(f"{len(segments)} source segments")
 
     # --- Stage 3: translate -------------------------------------------------
-    # A few machine-translation glitches that are wrong in this medical context.
-    corrections = {
-        "головку": "голову", "головки": "голови", "головок": "голови",
-        "головка": "голова", "Головка": "Голова",
-        "Кришталевий падає": "кристал випадає",
-        "Одного разу кристал випадає": "щойно кристал випадає",
-    }
-    segments = translate_segments(segments, args.source, args.target, corrections)
+    if args.pre_translated:
+        log("input is already in the target language - skipping translation")
+        for seg in segments:
+            seg["translated"] = seg["text"]
+    else:
+        # A few machine-translation glitches wrong in this medical context.
+        corrections = {
+            "головку": "голову", "головки": "голови", "головок": "голови",
+            "головка": "голова", "Головка": "Голова",
+            "Кришталевий падає": "кристал випадає",
+            "Одного разу кристал випадає": "щойно кристал випадає",
+        }
+        segments = translate_segments(
+            segments, args.source, args.target, corrections
+        )
     if args.save_srt:
         write_srt(segments, args.save_srt, key="translated")
         log(f"translated subtitles written to {args.save_srt}")
@@ -464,7 +508,9 @@ def main():
         voice = ESPEAK_VOICE.get(args.target, args.target)
         log(f"synthesizing with espeak-ng voice '{voice}'")
         synth = lambda text, wav: espeak_tts(text, voice, wav, rate=args.tts_rate)
-    track = assemble_track(segments, synth, workdir, max_speed=args.max_speed)
+    track = assemble_track(
+        segments, synth, workdir, max_speed=args.max_speed, sync=args.sync
+    )
 
     # --- Stage 5: export / mux ---------------------------------------------
     out = args.output
