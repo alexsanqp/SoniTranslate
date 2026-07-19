@@ -1,0 +1,24 @@
+# Direct StyleTTS2-UK dubbing (styletts2_dub.py) — CPU, no server, no HF token.
+#
+# Needs network access to HuggingFace (for the ~770 MB model weights) OR the
+# model files provided locally. The Python deps below install from PyPI/GitHub.
+#
+# Install order matters: num2words pins docopt, whose sdist fails to build on
+# modern setuptools, so install the heavy stack first (with docopt-ng, which
+# provides the `docopt` module) and the GitHub packages with --no-deps.
+#
+#   pip install "numpy<2" torch torchaudio soundfile librosa transformers \
+#       einops einops_exts munch pyyaml docopt-ng marisa-trie
+#   pip install --no-deps num2words \
+#       "styletts2-inference @ git+https://github.com/patriotyk/styletts2-inference.git" \
+#       "ipa-uk @ git+https://github.com/patriotyk/ipa-uk.git" \
+#       "ukrainian_accentor @ git+https://github.com/egorsmkv/ukrainian-accentor.git"
+#
+# Stress marking uses the neural ukrainian_accentor (bundled model, offline) —
+# we deliberately avoid ukrainian-word-stress's stanza dependency, which would
+# download a language model at runtime.
+#
+# Then, with the model files present (config.yml, pytorch_model.bin, a voice .pt):
+#   python styletts2_dub.py --srt uk.srt --config config.yml \
+#       --weights pytorch_model.bin --voice "Марина Панас.pt" \
+#       --video in.mp4 --output out.mp4
